@@ -6,15 +6,15 @@ import * as dotenv from "dotenv";
 dotenv.config();
 
 const DOMAINS_MAP = {
-  de: "https://www.addingvalue.se",
+  se: "https://www.addingvalue.se",
 };
 
 const PROXIES = {
-  de: process.env.BRD_PROXY_SE,
+  se: process.env.BRD_PROXY_SE,
 };
 
 const USER_AGENTS = {
-  de: "AddingValue-SE-CacheWarmer/1.0",
+  se: "AddingValue-SE-CacheWarmer/1.0",
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
