@@ -408,7 +408,7 @@ async function warmUrls(urls, country, logger, batchSize = 3, delay = 7000) {
             message: "",
           });
 
-          if (["REVALIDATED", "MISS", "PRERENDER"].includes(vercelCache)) {
+          if (["REVALIDATED", "MISS", "PRERENDER","STALE"].includes(vercelCache)) {
             await purgeCloudflareCache(url);
           }
         } catch (err) {
