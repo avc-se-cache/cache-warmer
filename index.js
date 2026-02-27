@@ -96,18 +96,33 @@ class AppsScriptLogger {
   }
 
   async flush() {
-    if (!APPS_SCRIPT_URL || this.rows.length === 0) return;
+    if (!APPS_SCRIPT_URL) {
+      console.warn("Apps Script logging disabled (missing APPS_SCRIPT_URL).");
+      return;
+    }
+    if (this.rows.length === 0) return;
 
-    console.log(`📝 Logging ${this.rows.length} rows to GSheets`);
-
-    const res = await axios.post(
-      APPS_SCRIPT_URL,
-      { sheetName: this.sheetName, rows: this.rows },
-      { timeout: 20000, headers: { "Content-Type": "application/json" } }
-    );
-
-    console.log("Apps Script response:", res.status, res.data);
-    this.rows = [];
+    try {
+      console.log(`📝 Logging ${this.rows.length} rows to GSheets`);
+      const res = await axios.post(
+        APPS_SCRIPT_URL,
+        {
+          sheetName: this.sheetName,
+          rows: this.rows,
+          deleteOldestTabs: 10 // Flag untk trigger penghapusan tab lama
+        },
+        { timeout: 60000, headers: { "Content-Type": "application/json" } }
+      );
+      console.log("Apps Script response:", res.status, res.data);
+      if (!res.data?.ok) console.warn("Apps Script replied error:", res.data);
+      this.rows = []; // bersihkan buffer
+    } catch (e) {
+      console.warn(
+        "Apps Script logging error:",
+        e?.response?.status,
+        e?.response?.data || e?.message || e
+      );
+    }
   }
 }
 
@@ -157,18 +172,31 @@ async function fetchUrlsFromSitemap(sitemapUrl, country) {
 
 /* ================= CLOUDFLARE ================= */
 async function purgeCloudflareCache(url) {
-  if (!CLOUDFLARE_ZONE_ID || !CLOUDFLARE_API_TOKEN) return;
+  if (!CLOUDFLARE_ZONE_ID || !CLOUDFLARE_API_TOKEN) {
+    console.log(`[Cloudflare] Skip purge (missing credentials) for: ${url}`);
+    return;
+  }
 
-  await axios.post(
-    `https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache`,
-    { files: [url] },
-    {
-      headers: {
-        Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
-        "Content-Type": "application/json",
-      },
+  try {
+    const purgeRes = await axios.post(
+      `https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache`,
+      { files: [url] },
+      {
+        headers: {
+          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    if (purgeRes.data?.success) {
+      console.log(`✅ Cloudflare cache purged: ${url}`);
+    } else {
+      console.warn(`⚠️ Failed to purge Cloudflare: ${url}`);
     }
-  );
+  } catch (error) {
+    console.warn(`❌ Error purging Cloudflare: ${url}`);
+  }
 }
 
 /* ================= WARMER ================= */
@@ -186,67 +214,61 @@ async function retryableGet(url, cfg, retries = 3) {
   throw last;
 }
 
-async function warmUrls(urls, country, logger, batchSize = 3, delay = 7000) {
+async function warmUrls(urls, country, logger, delay = 2000) {
   const agent = new HttpsProxyAgent(PROXIES[country]);
 
-  const batches = Array.from(
-    { length: Math.ceil(urls.length / batchSize) },
-    (_, i) => urls.slice(i * batchSize, i * batchSize + batchSize)
-  );
+  for (const url of urls) {
+    const t0 = Date.now();
+    let countryTag = country;
+    try {
+      const res = await retryableGet(
+        url,
+        {
+          httpsAgent: agent,
+          headers: { "User-Agent": USER_AGENTS[country] },
+          timeout: 30000,
+        },
+        3
+      );
 
-  for (const batch of batches) {
-    await Promise.all(
-      batch.map(async (url) => {
-        const t0 = Date.now();
-        try {
-          const res = await retryableGet(
-            url,
-            {
-              httpsAgent: agent,
-              headers: { "User-Agent": USER_AGENTS[country] },
-              timeout: 30000,
-            },
-            3
-          );
+      const dt = Date.now() - t0;
+      const cfCache = res.headers["cf-cache-status"] || "N/A";
+      const rawVercelCache = res.headers["x-vercel-cache"] || "N/A";
+      const vercelCache = rawVercelCache.toUpperCase();
+      const cfRay = res.headers["cf-ray"] || "N/A";
 
-          const dt = Date.now() - t0;
-          const cfCache = res.headers["cf-cache-status"] || "N/A";
-          const vercelCache = res.headers["x-vercel-cache"] || "N/A";
-          const cfRay = res.headers["cf-ray"] || "N/A";
+      const edge = extractCfEdge(cfRay);
+      countryTag = edge !== "N/A" ? edge : country;
 
-          const edge = extractCfEdge(cfRay);
-          const countryTag = edge !== "N/A" ? edge : country;
+      console.log(
+        `[${countryTag}] ${res.status} cf=${cfCache} vercel=${rawVercelCache} - ${url}`
+      );
 
-          console.log(
-            `[${countryTag}] ${res.status} cf=${cfCache} vercel=${vercelCache} - ${url}`
-          );
+      logger.log({
+        country: countryTag,
+        url,
+        status: res.status,
+        cfCache,
+        vercelCache: rawVercelCache,
+        cfRay,
+        responseMs: dt,
+        error: 0,
+      });
 
-          logger.log({
-            country: countryTag,
-            url,
-            status: res.status,
-            cfCache,
-            vercelCache,
-            cfRay,
-            responseMs: dt,
-            error: 0,
-          });
-
-          if (
-            ["MISS", "REVALIDATED", "PRERENDER", "STALE"].includes(vercelCache)
-          ) {
-            await purgeCloudflareCache(url);
-          }
-        } catch (e) {
-          logger.log({
-            country,
-            url,
-            error: 1,
-            message: e?.message || "request failed",
-          });
-        }
-      })
-    );
+      if (
+        ["MISS", "REVALIDATED", "PRERENDER", "STALE"].includes(vercelCache)
+      ) {
+        await purgeCloudflareCache(url);
+      }
+    } catch (e) {
+      console.log(`[${countryTag}] error ${url}: ${e?.message}`);
+      logger.log({
+        country,
+        url,
+        error: 1,
+        message: e?.message || "request failed",
+      });
+    }
 
     await sleep(delay);
   }
